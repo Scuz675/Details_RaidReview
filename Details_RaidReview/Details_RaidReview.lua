@@ -5,12 +5,12 @@ end
 
 local PLUGIN_NAME = "Raid Review"
 local PLUGIN_ABSOLUTE_NAME = "DETAILS_PLUGIN_RAID_REVIEW"
-local PLUGIN_VERSION = "v0.3.2"
+local PLUGIN_VERSION = "v0.4.3"
 local PLUGIN_ICON = [[Interface\Icons\INV_Misc_Note_01]]
 
 local Review = _detalhes:NewPluginObject("Details_RaidReview")
 local ReviewFrame = Review.Frame
-Review:SetPluginDescription("Post-combat raid review: deaths, CC breaks, interrupts, dispels, defensive cooldowns, resurrections and consumable usage.")
+Review:SetPluginDescription("Post-combat raid review: performance, deaths, CC breaks, interrupts, dispels, defensive cooldowns, resurrections and consumable usage.")
 
 local DF = _detalhes.gump
 local SharedMedia = LibStub and LibStub:GetLibrary("LibSharedMedia-3.0", true)
@@ -33,6 +33,10 @@ Review.RowHeight = 14
 Review.CanShow = 0
 Review.currentCombat = nil
 Review.currentData = {}
+Review.ScrollOffset = 0
+Review.ScrollStep = 3
+Review.ScrollBarVisible = false
+Review.MaxBarMetric = 1
 
 local function getOnlyName(name)
     if not name then
@@ -100,6 +104,49 @@ local function getHealthConsumableCount(healActor)
     return total
 end
 
+local function getActorRate(actor, cachedKey)
+    if not actor then
+        return 0
+    end
+
+    -- Details normally maintains last_dps / last_hps using the same timing
+    -- rules as its standard Damage Done and Healing Done displays. Prefer
+    -- those cached values so Raid Review matches what the player sees there.
+    local cached = tonumber(actor[cachedKey]) or 0
+    if cached > 0 then
+        return cached
+    end
+
+    -- Fallback for a segment which has not had its normal Details refresh yet.
+    local total = tonumber(actor.total) or 0
+    if total <= 0 then
+        return 0
+    end
+
+    local elapsed = 0
+    if actor.Tempo then
+        local ok, value = pcall(actor.Tempo, actor)
+        if ok and type(value) == "number" then
+            elapsed = value
+        end
+    end
+
+    if elapsed > 0 then
+        return total / elapsed
+    end
+    return 0
+end
+
+local function formatAmount(value)
+    value = tonumber(value) or 0
+    return _detalhes:ToK(value)
+end
+
+local function formatRate(value)
+    value = tonumber(value) or 0
+    return _detalhes:ToK(value) .. "/s"
+end
+
 local function getDeathCount(combat, name)
     local deaths = 0
     local deathTable = combat and combat.last_events_tables
@@ -125,45 +172,64 @@ end
 local function hasReviewActivity(data)
     return (data.deaths or 0) > 0
         or (data.ccBreaks or 0) > 0
+        or (data.damageTaken or 0) > 0
         or getActivityScore(data) > 0
 end
 
 local function buildSummary(data)
-    local options = Review.saveddata or {}
-    local chunks = {}
-
-    if options.alwaysShowDeaths ~= false or (data.deaths or 0) > 0 then
-        chunks[#chunks + 1] = "X" .. (data.deaths or 0)
-    end
-    if (data.ccBreaks or 0) > 0 then chunks[#chunks + 1] = "!" .. data.ccBreaks end
-    if (data.interrupts or 0) > 0 then chunks[#chunks + 1] = "I" .. data.interrupts end
-    if (data.dispels or 0) > 0 then chunks[#chunks + 1] = "D" .. data.dispels end
-    if (data.defensives or 0) > 0 then chunks[#chunks + 1] = "C" .. data.defensives end
-    if options.showResurrections ~= false and (data.resses or 0) > 0 then chunks[#chunks + 1] = "R" .. data.resses end
-    if (data.potions or 0) > 0 then chunks[#chunks + 1] = "P" .. data.potions end
-    if options.showHealthConsumables ~= false and (data.healthConsumables or 0) > 0 then chunks[#chunks + 1] = "H" .. data.healthConsumables end
-
-    if #chunks == 0 then
-        return "-"
-    end
-
-    return table.concat(chunks, " ")
+    -- Keep the visible row deliberately quiet. The bar length and row order
+    -- carry the review signal; the tooltip carries the detailed evidence.
+    return "X" .. (data.deaths or 0)
 end
 
 local function dataSort(a, b)
-    -- Review problems first, then useful raid actions. This deliberately avoids
-    -- ranking by damage taken because tanks are expected to take more damage.
-    if a.deaths ~= b.deaths then return a.deaths > b.deaths end
-    if a.ccBreaks ~= b.ccBreaks then return a.ccBreaks > b.ccBreaks end
+    local mode = (Review.saveddata and Review.saveddata.sortMode) or "priority"
 
-    local aActivity = getActivityScore(a)
-    local bActivity = getActivityScore(b)
-    if aActivity ~= bActivity then return aActivity > bActivity end
+    if mode == "damage" then
+        if a.damageTaken ~= b.damageTaken then return a.damageTaken > b.damageTaken end
+        if a.deaths ~= b.deaths then return a.deaths > b.deaths end
 
-    if a.interrupts ~= b.interrupts then return a.interrupts > b.interrupts end
-    if a.dispels ~= b.dispels then return a.dispels > b.dispels end
-    if a.defensives ~= b.defensives then return a.defensives > b.defensives end
+    elseif mode == "deaths" then
+        if a.deaths ~= b.deaths then return a.deaths > b.deaths end
+        if a.damageTaken ~= b.damageTaken then return a.damageTaken > b.damageTaken end
+
+    elseif mode == "actions" then
+        local aActivity = getActivityScore(a)
+        local bActivity = getActivityScore(b)
+        if aActivity ~= bActivity then return aActivity > bActivity end
+        if a.interrupts ~= b.interrupts then return a.interrupts > b.interrupts end
+        if a.dispels ~= b.dispels then return a.dispels > b.dispels end
+        if a.defensives ~= b.defensives then return a.defensives > b.defensives end
+
+    else
+        -- Default raid-leader view: problems first, then incoming damage.
+        -- This is intentionally lexicographic rather than pretending that one
+        -- interrupt is mathematically equivalent to some amount of damage.
+        if a.deaths ~= b.deaths then return a.deaths > b.deaths end
+        if a.ccBreaks ~= b.ccBreaks then return a.ccBreaks > b.ccBreaks end
+        if a.damageTaken ~= b.damageTaken then return a.damageTaken > b.damageTaken end
+
+        local aActivity = getActivityScore(a)
+        local bActivity = getActivityScore(b)
+        if aActivity ~= bActivity then return aActivity > bActivity end
+    end
+
     return (a.name or "") < (b.name or "")
+end
+
+local function getBarMetric(data)
+    local mode = (Review.saveddata and Review.saveddata.sortMode) or "priority"
+    if mode == "damage" then
+        return data.damageTaken or 0
+    elseif mode == "deaths" then
+        return data.deaths or 0
+    elseif mode == "actions" then
+        return getActivityScore(data)
+    end
+
+    -- Review Priority is a visual attention meter only. Deaths and CC breaks
+    -- establish urgency; normalized damage taken fills in the remaining signal.
+    return (data.priorityScore or 0)
 end
 
 local function addTooltipLine(left, right, lr, lg, lb, rr, rg, rb)
@@ -242,6 +308,17 @@ function Review:ShowPlayerTooltip(data, anchor)
         GameTooltip:AddLine(data.class, c.r, c.g, c.b)
     end
 
+    addSection("Performance")
+    addTooltipLine("Damage Done", formatAmount(data.damageDone or 0))
+    addTooltipLine("DPS", formatRate(data.dps or 0))
+    addTooltipLine("Healing Done", formatAmount(data.healingDone or 0))
+    addTooltipLine("HPS", formatRate(data.hps or 0))
+
+    local overheal = data.overheal or 0
+    local totalHealingAttempted = (data.healingDone or 0) + overheal
+    local overhealPercent = totalHealingAttempted > 0 and (overheal / totalHealingAttempted * 100) or 0
+    addTooltipLine("Overheal", formatAmount(overheal) .. " (" .. string.format("%.1f", overhealPercent) .. "%)")
+
     addSection("Review Flags")
     addTooltipLine("Deaths", data.deaths, 1, 1, 1, data.deaths > 0 and 1 or 0.8, data.deaths > 0 and 0.25 or 0.8, data.deaths > 0 and 0.25 or 0.8)
     addTooltipLine("CC Breaks", data.ccBreaks, 1, 1, 1, data.ccBreaks > 0 and 1 or 0.8, data.ccBreaks > 0 and 0.55 or 0.8, data.ccBreaks > 0 and 0.15 or 0.8)
@@ -256,6 +333,9 @@ function Review:ShowPlayerTooltip(data, anchor)
 
     addSection("Context")
     addTooltipLine("Damage Taken", _detalhes:ToK(data.damageTaken or 0))
+    local sortMode = (Review.saveddata and Review.saveddata.sortMode) or "priority"
+    local sortLabels = {priority = "Review Priority", damage = "Damage Taken", deaths = "Deaths", actions = "Raid Actions"}
+    addTooltipLine("Bar / Sort", sortLabels[sortMode] or sortMode)
 
     if misc then
         addSpellSection("Interrupts Used", misc.interrupt_spells, "counter")
@@ -457,7 +537,7 @@ function Review:RefreshRowStyle(row)
     row.textfont = font
     row.texture = instance.row_info.texture
     row.shadow = instance.row_info.textL_outline
-    row:SetWidth(instance.baseframe:GetWidth() - 6)
+    row:SetWidth(instance.baseframe:GetWidth() - (Review.ScrollBarVisible and 11 or 6))
 end
 
 function Review:NewRow(index)
@@ -496,12 +576,94 @@ function Review:NewRow(index)
         Review:HidePlayerTooltip()
     end)
 
+    hitbox:EnableMouseWheel(true)
+    hitbox:SetScript("OnMouseWheel", function(frame, delta)
+        Review:Scroll(delta)
+    end)
+
     row.hitbox = hitbox
 
     Review.Rows[#Review.Rows + 1] = row
     Review:RefreshRowStyle(row)
     row:Hide()
     return row
+end
+
+function Review:EnsureScrollBar()
+    if Review.ScrollTrack then
+        return
+    end
+
+    local track = CreateFrame("Frame", "DetailsRaidReviewScrollTrack", ReviewFrame)
+    track:SetWidth(4)
+    track:SetPoint("TOPRIGHT", ReviewFrame, "TOPRIGHT", -1, -1)
+    track:SetPoint("BOTTOMRIGHT", ReviewFrame, "BOTTOMRIGHT", -1, 1)
+
+    local bg = track:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(track)
+    bg:SetTexture(0, 0, 0, 0.25)
+
+    local thumb = track:CreateTexture(nil, "OVERLAY")
+    thumb:SetTexture(0.75, 0.75, 0.75, 0.75)
+    thumb:SetWidth(4)
+    thumb:SetPoint("TOP", track, "TOP", 0, 0)
+
+    track:SetFrameLevel(ReviewFrame:GetFrameLevel() + 30)
+
+    Review.ScrollTrack = track
+    Review.ScrollThumb = thumb
+    track:Hide()
+
+    ReviewFrame:EnableMouseWheel(true)
+    ReviewFrame:SetScript("OnMouseWheel", function(frame, delta)
+        Review:Scroll(delta)
+    end)
+end
+
+function Review:UpdateScrollBar()
+    Review:EnsureScrollBar()
+
+    local total = #Review.currentData
+    local visible = Review.CanShow or 1
+    local maxOffset = max(0, total - visible)
+    Review.ScrollBarVisible = maxOffset > 0
+
+    if not Review.ScrollBarVisible then
+        Review.ScrollOffset = 0
+        Review.ScrollTrack:Hide()
+        return
+    end
+
+    if Review.ScrollOffset > maxOffset then Review.ScrollOffset = maxOffset end
+    if Review.ScrollOffset < 0 then Review.ScrollOffset = 0 end
+
+    Review.ScrollTrack:Show()
+    local trackHeight = max(1, Review.ScrollTrack:GetHeight())
+    local thumbHeight = max(12, floor(trackHeight * (visible / total)))
+    if thumbHeight > trackHeight then thumbHeight = trackHeight end
+    Review.ScrollThumb:SetHeight(thumbHeight)
+    Review.ScrollThumb:ClearAllPoints()
+
+    local travel = max(0, trackHeight - thumbHeight)
+    local progress = maxOffset > 0 and (Review.ScrollOffset / maxOffset) or 0
+    Review.ScrollThumb:SetPoint("TOP", Review.ScrollTrack, "TOP", 0, -(travel * progress))
+end
+
+function Review:Scroll(delta)
+    if not Review.currentData or #Review.currentData <= (Review.CanShow or 1) then
+        return
+    end
+
+    local maxOffset = max(0, #Review.currentData - Review.CanShow)
+    local step = Review.ScrollStep or 3
+    if delta > 0 then
+        Review.ScrollOffset = max(0, Review.ScrollOffset - step)
+    elseif delta < 0 then
+        Review.ScrollOffset = min(maxOffset, Review.ScrollOffset + step)
+    end
+
+    Review:HidePlayerTooltip()
+    Review:RenderRows()
 end
 
 function Review:UpdateLayout()
@@ -576,6 +738,11 @@ function Review:BuildReviewData(combat)
             potions = getPotionCount(misc),
             healthConsumables = getHealthConsumableCount(heal),
             damageTaken = damage and (damage.damage_taken or 0) or 0,
+            damageDone = damage and (damage.total or 0) or 0,
+            dps = getActorRate(damage, "last_dps"),
+            healingDone = heal and (heal.total or 0) or 0,
+            hps = getActorRate(heal, "last_hps"),
+            overheal = heal and (heal.totalover or 0) or 0,
         }
 
         if (Review.saveddata and Review.saveddata.showInactivePlayers == false) and not hasReviewActivity(rowData) then
@@ -595,8 +762,73 @@ function Review:BuildReviewData(combat)
         end
     end
 
+    local maxDamageTaken = 0
+    for _, rowData in ipairs(data) do
+        if (rowData.damageTaken or 0) > maxDamageTaken then
+            maxDamageTaken = rowData.damageTaken or 0
+        end
+    end
+
+    for _, rowData in ipairs(data) do
+        local damagePercent = maxDamageTaken > 0 and ((rowData.damageTaken or 0) / maxDamageTaken * 100) or 0
+        rowData.damagePercent = damagePercent
+        rowData.priorityScore = damagePercent + ((rowData.deaths or 0) * 100) + ((rowData.ccBreaks or 0) * 50)
+    end
+
     sort(data, dataSort)
     return data
+end
+
+function Review:RenderRows()
+    Review:UpdateScrollBar()
+
+    Review.MaxBarMetric = 0
+    for _, data in ipairs(Review.currentData) do
+        local metric = getBarMetric(data)
+        if metric > Review.MaxBarMetric then
+            Review.MaxBarMetric = metric
+        end
+    end
+    if Review.MaxBarMetric <= 0 then Review.MaxBarMetric = 1 end
+
+    for index, row in ipairs(Review.ShownRows) do
+        local data = Review.currentData[(Review.ScrollOffset or 0) + index]
+        if data then
+            row.reviewData = data
+            row:SetLeftText(getOnlyName(data.name))
+            row:SetRightText(buildSummary(data))
+
+            local metric = getBarMetric(data)
+            local percent = (metric / Review.MaxBarMetric) * 100
+            if metric > 0 and percent < 2 then percent = 2 end
+            row:SetValue(percent)
+
+            -- Keep colour purely informational: the bar uses the player's class
+            -- colour, while bar length carries the selected review metric and X#
+            -- on the right carries death count. This avoids making every death
+            -- row look identical while still keeping deaths immediately visible.
+            local options = Review.saveddata or {}
+            local color = options.useClassColors ~= false and data.class and RAID_CLASS_COLORS[data.class]
+            if color then
+                row:SetColor(color.r, color.g, color.b, 0.90)
+            else
+                row:SetColor(0.55, 0.55, 0.55, 0.85)
+            end
+
+            local coords = data.class and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[data.class]
+            row._icon:SetTexture([[Interface\Glues\CharacterCreate\UI-CharacterCreate-Classes]])
+            if coords then
+                row._icon:SetTexCoord(unpack(coords))
+            else
+                row._icon:SetTexCoord(0, 1, 0, 1)
+            end
+            Review:RefreshRowStyle(row)
+            row:Show()
+        else
+            row.reviewData = nil
+            row:Hide()
+        end
+    end
 end
 
 function Review:RefreshData()
@@ -608,44 +840,12 @@ function Review:RefreshData()
     Review:UpdateLayout()
 
     local combat = instance:GetShowingCombat()
+    if Review.currentCombat and Review.currentCombat ~= combat then
+        Review.ScrollOffset = 0
+    end
     Review.currentCombat = combat
     Review.currentData = Review:BuildReviewData(combat)
-
-    for index, row in ipairs(Review.ShownRows) do
-        local data = Review.currentData[index]
-        if data then
-            row.reviewData = data
-            row:SetLeftText(getOnlyName(data.name))
-            row:SetRightText(buildSummary(data))
-            row:SetValue(100)
-
-            local options = Review.saveddata or {}
-            if options.highlightDeaths ~= false and data.deaths > 0 then
-                row:SetColor(0.82, 0.20, 0.20, 0.92)
-            elseif options.highlightCCBreaks ~= false and data.ccBreaks > 0 then
-                row:SetColor(0.90, 0.48, 0.12, 0.90)
-            else
-                local color = options.useClassColors ~= false and data.class and RAID_CLASS_COLORS[data.class]
-                if color then
-                    row:SetColor(color.r, color.g, color.b, 0.85)
-                else
-                    row:SetColor(0.55, 0.55, 0.55, 0.85)
-                end
-            end
-
-            local coords = data.class and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[data.class]
-            row._icon:SetTexture([[Interface\Glues\CharacterCreate\UI-CharacterCreate-Classes]])
-            if coords then
-                row._icon:SetTexCoord(unpack(coords))
-            else
-                row._icon:SetTexCoord(0, 1, 0, 1)
-            end
-            row:Show()
-        else
-            row.reviewData = nil
-            row:Hide()
-        end
-    end
+    Review:RenderRows()
 end
 
 function Review:OnDetailsEvent(event, ...)
@@ -706,25 +906,23 @@ local function buildOptionsPanel()
             desc = "Show players even when they have no deaths, CC breaks or recorded raid actions in the selected segment.",
         },
         {
-            type = "toggle",
-            get = function() return Review.saveddata.alwaysShowDeaths end,
-            set = function(self, fixedparam, value) Review.saveddata.alwaysShowDeaths = value; Review:RefreshData() end,
-            name = "Always Show X0",
-            desc = "Always show the death count on every row so a clean pull is obvious at a glance.",
-        },
-        {
-            type = "toggle",
-            get = function() return Review.saveddata.showResurrections end,
-            set = function(self, fixedparam, value) Review.saveddata.showResurrections = value; Review:RefreshData() end,
-            name = "Show Resurrections",
-            desc = "Add R# to the compact row summary when a player resurrected someone.",
-        },
-        {
-            type = "toggle",
-            get = function() return Review.saveddata.showHealthConsumables end,
-            set = function(self, fixedparam, value) Review.saveddata.showHealthConsumables = value; Review:RefreshData() end,
-            name = "Show Health Consumables",
-            desc = "Add H# to the compact row summary for health potions and healthstones detected by Details.",
+            type = "select",
+            get = function() return Review.saveddata.sortMode end,
+            values = function()
+                local function choose(_, _, value)
+                    Review.saveddata.sortMode = value
+                    Review.ScrollOffset = 0
+                    Review:RefreshData()
+                end
+                return {
+                    {value = "priority", label = "Review Priority", onclick = choose},
+                    {value = "damage", label = "Damage Taken", onclick = choose},
+                    {value = "deaths", label = "Deaths", onclick = choose},
+                    {value = "actions", label = "Raid Actions", onclick = choose},
+                }
+            end,
+            name = "Sort Rows",
+            desc = "Review Priority puts deaths and CC breaks first, then orders by damage taken. Other modes let the bars and ordering represent one specific metric.",
         },
         {
             type = "toggle",
@@ -732,20 +930,6 @@ local function buildOptionsPanel()
             set = function(self, fixedparam, value) Review.saveddata.useClassColors = value; Review:RefreshData() end,
             name = "Use Class Colors",
             desc = "Use class colours for normal rows. Death and CC-break highlighting can override this.",
-        },
-        {
-            type = "toggle",
-            get = function() return Review.saveddata.highlightDeaths end,
-            set = function(self, fixedparam, value) Review.saveddata.highlightDeaths = value; Review:RefreshData() end,
-            name = "Highlight Deaths",
-            desc = "Tint rows red when that player died in the selected segment.",
-        },
-        {
-            type = "toggle",
-            get = function() return Review.saveddata.highlightCCBreaks end,
-            set = function(self, fixedparam, value) Review.saveddata.highlightCCBreaks = value; Review:RefreshData() end,
-            name = "Highlight CC Breaks",
-            desc = "Tint rows orange when that player broke crowd control.",
         },
         {
             type = "range",
@@ -838,12 +1022,8 @@ local function InstallReviewPlugin()
 
     Review.saveddata = saveddata or {}
     if Review.saveddata.showInactivePlayers == nil then Review.saveddata.showInactivePlayers = true end
-    if Review.saveddata.alwaysShowDeaths == nil then Review.saveddata.alwaysShowDeaths = true end
-    if Review.saveddata.showResurrections == nil then Review.saveddata.showResurrections = true end
-    if Review.saveddata.showHealthConsumables == nil then Review.saveddata.showHealthConsumables = true end
+    if Review.saveddata.sortMode == nil then Review.saveddata.sortMode = "priority" end
     if Review.saveddata.useClassColors == nil then Review.saveddata.useClassColors = true end
-    if Review.saveddata.highlightDeaths == nil then Review.saveddata.highlightDeaths = true end
-    if Review.saveddata.highlightCCBreaks == nil then Review.saveddata.highlightCCBreaks = true end
     Review.saveddata.deathHits = Review.saveddata.deathHits or 3
     Review.saveddata.maxSpellRows = Review.saveddata.maxSpellRows or 6
 

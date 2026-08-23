@@ -2,7 +2,7 @@
 ## Title: Details!: Raid Review (plugin)
 ## Notes: Post-combat raid review plugin for Details!. Raid-leader post-combat review with deaths, CC breaks, interrupts, dispels, defensives, resurrections and consumables.
 ## Author: Scuz / OpenAI
-## Version: 0.3.2
+## Version: 0.4.3
 ## RequiredDeps: Details
 ## OptionalDeps: LibSharedMedia-3.0
 ## DefaultState: Enabled
